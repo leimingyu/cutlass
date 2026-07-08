@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Build Report: 70_blackwell_fp16_gemm on NVIDIA Thor (SM 11.0)</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 40px auto;
+    padding: 0 24px;
+    color: #1a1a1a;
+    line-height: 1.65;
+  }
+  h1 {
+    font-size: 1.6em;
+    border-bottom: 2px solid #ddd;
+    padding-bottom: 10px;
+  }
+  h2 {
+    font-size: 1.2em;
+    margin-top: 2.2em;
+    color: #2c3e50;
+    border-left: 4px solid #2c3e50;
+    padding-left: 10px;
+  }
+  h3 {
+    font-size: 1.05em;
+    margin-top: 1.6em;
+    color: #444;
+  }
+  code {
+    background: #f4f4f4;
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    font-size: 0.88em;
+  }
+  pre {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    font-size: 0.85em;
+    line-height: 1.55;
+    margin: 1em 0;
+  }
+  pre .comment { color: #6c7086; }
+  pre .flag    { color: #89dceb; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+    font-size: 0.93em;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: #2c3e50;
+    color: #fff;
+  }
+  tr:nth-child(even) { background: #f9f9f9; }
+  .note {
+    background: #fff8e1;
+    border-left: 4px solid #f0ad4e;
+    padding: 10px 16px;
+    margin: 1em 0;
+    font-size: 0.95em;
+  }
+  .success {
+    background: #e8f5e9;
+    border-left: 4px solid #43a047;
+    padding: 10px 16px;
+    margin: 1em 0;
+    font-size: 0.95em;
+  }
+  .info {
+    background: #e3f2fd;
+    border-left: 4px solid #1e88e5;
+    padding: 10px 16px;
+    margin: 1em 0;
+    font-size: 0.95em;
+  }
+  .diff-add { color: #a6e3a1; }
+  .diff-del { color: #f38ba8; }
+  .diff-hdr { color: #89b4fa; }
+  .step-num {
+    display: inline-block;
+    background: #2c3e50;
+    color: #fff;
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    text-align: center;
+    line-height: 24px;
+    font-size: 0.85em;
+    font-weight: bold;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  ul { padding-left: 1.4em; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Build Report: <code>70_blackwell_fp16_gemm</code> on NVIDIA Thor (SM 11.0)</h1>
+
+<p>
+  This report documents building and running
+  <code>cutlass/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu</code>
+  on an <strong>NVIDIA Thor GPU (SM 11.0)</strong> using CUDA 13.1.
+  It also consolidates the build of
+  <code>48_hopper_warp_specialized_gemm</code> into a new, clean
+  <code>build_sm110/</code> directory so that both examples share identical
+  compiler flags and can be compared side-by-side.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Environment</h2>
+
+<table>
+  <tr><th>Component</th><th>Version / Value</th></tr>
+  <tr><td>GPU</td><td>NVIDIA Thor &mdash; compute capability <strong>11.0</strong></td></tr>
+  <tr><td>Driver</td><td>580.00</td></tr>
+  <tr><td>CUDA Toolkit</td><td>13.1 (<code>nvcc</code> V13.1.115)</td></tr>
+  <tr><td>CMake</td><td>3.28.3</td></tr>
+  <tr><td>Host compiler</td><td>GCC (aarch64-linux-gnu)</td></tr>
+  <tr><td>CUTLASS source</td><td><code>cutlass/</code></td></tr>
+  <tr><td>New build directory</td><td><code>build_sm110/</code></td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Impact on the Previous Build of Example 48</h2>
+
+<p>
+  The previous build report (<code>build_48_hopper_warp_specialized_gemm.html</code>)
+  placed the example 48 binary in <code>build/examples/48_hopper_warp_specialized_gemm/</code>
+  using an ad-hoc <code>nvcc</code> invocation.
+  Building example 70 alongside it motivates a <strong>unified, clean build tree</strong>
+  (<code>build_sm110/</code>) so that:
+</p>
+<ul>
+  <li>Both examples are compiled with <em>identical</em> flags and the same
+      <code>sm_110a</code> target.</li>
+  <li>The build is reproducible from scratch without relying on the earlier
+      CMake-generated <code>build/</code> tree.</li>
+  <li>Future examples can be added to <code>build_sm110/</code> with the same
+      one-liner pattern.</li>
+</ul>
+
+<div class="info">
+  <strong>Example 48 source is unchanged</strong> from the previous build report.
+  The only difference is the output path: <code>build_sm110/</code> instead of
+  <code>build/</code>. The patched source
+  (<code>48_hopper_warp_specialized_gemm.cu</code>) already targets
+  <code>Sm100</code> / <code>CUTLASS_ARCH_MMA_SM100_SUPPORTED</code> and is
+  correct for SM 11.0.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Why Example 70 Cannot Be Run Naively on SM 11.0</h2>
+
+<table>
+  <tr><th>#</th><th>Problem</th><th>Root cause</th></tr>
+  <tr>
+    <td>1</td>
+    <td>Runtime check <code>props.major != 10 || props.minor != 0</code> rejects SM 11.0.</td>
+    <td>The guard was written for Blackwell SM 100 only; Thor SM 11.0 has
+        <code>major=11</code>.</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>CMake 3.28 cannot generate correct arch flags for SM 11.0 (same issue as example 48).</td>
+    <td>CMake 3.28 zero-pads the arch number, producing the invalid
+        <code>compute_1100</code>.</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>Note:</strong> The CUDA version check (<code>__CUDACC_VER_MAJOR__ &lt; 12 ||
+  (__CUDACC_VER_MAJOR__ == 12 &amp;&amp; __CUDACC_VER_MINOR__ &lt; 8)</code>) already
+  passes with CUDA 13.1 and requires <em>no change</em>.
+  The kernel itself (<code>CUTLASS_ARCH_MMA_SM100_SUPPORTED</code>, <code>Sm100</code>
+  arch tag, <code>Shape&lt;int,int,int,int&gt;</code> problem shape) is already correct
+  for SM 11.0 when compiled with <code>sm_110a</code> &mdash; no template changes are needed.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Step-by-Step Build Instructions</h2>
+
+<!-- ─── Step 1 ─── -->
+<h3><span class="step-num">1</span> Verify the environment</h3>
+
+<pre>nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+<span class="comment"># Expected: NVIDIA Thor, 11.0</span>
+
+nvcc --version
+<span class="comment"># Expected: release 13.1 or newer</span></pre>
+
+<!-- ─── Step 2 ─── -->
+<h3><span class="step-num">2</span> Patch <code>70_blackwell_fp16_gemm.cu</code></h3>
+
+<p>
+  Back up the original and apply the single runtime-check fix.
+  No template or kernel-configuration changes are required.
+</p>
+
+<pre><span class="comment"># Back up</span>
+cp cutlass/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu \
+   cutlass/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu.bak</pre>
+
+<p>Apply the following diff:</p>
+
+<pre><span class="diff-hdr">--- 70_blackwell_fp16_gemm.cu.bak</span>
+<span class="diff-hdr">+++ 70_blackwell_fp16_gemm.cu</span>
+
+<span class="diff-hdr">@@ line 458 — runtime arch check @@</span>
+<span class="diff-del">-  if (props.major != 10 || props.minor != 0) {</span>
+<span class="diff-del">-    std::cerr &lt;&lt; "This example requires a GPU with compute capability 100a)." &lt;&lt; std::endl;</span>
+<span class="diff-add">+  if (props.major &lt; 10) {</span>
+<span class="diff-add">+    std::cerr &lt;&lt; "This example requires a GPU with compute capability &gt;= 100 (SM 100 or SM 110)." &lt;&lt; std::endl;</span></pre>
+
+<p>
+  This is the <strong>only change</strong> needed. The kernel configuration
+  (<code>ArchTag = Sm100</code>, <code>MmaTileShape_MNK = Shape&lt;_256,_128,_64&gt;</code>,
+  <code>ClusterShape_MNK = Shape&lt;_2,_2,_1&gt;</code>, 4-D problem shape) is already
+  correct for SM 11.0.
+</p>
+
+<!-- ─── Step 3 ─── -->
+<h3><span class="step-num">3</span> Create the unified <code>build_sm110/</code> directory</h3>
+
+<pre>mkdir -p build_sm110/examples/48_hopper_warp_specialized_gemm
+mkdir -p build_sm110/examples/70_blackwell_gemm</pre>
+
+<!-- ─── Step 4 ─── -->
+<h3><span class="step-num">4</span> Define shared compiler variables</h3>
+
+<p>
+  Both examples use identical flags. Define them once to avoid repetition and
+  guarantee consistency.
+</p>
+
+<pre>CUTLASS_DIR=/home/leimyu/01_research/cutlass_dsmem/cutlass
+BUILD_DIR=/home/leimyu/01_research/cutlass_dsmem/build_sm110
+
+NVCC_FLAGS="-std=c++17 -O3 \
+  <span class="flag">--generate-code=arch=compute_110a,code=[sm_110a,compute_110a]</span> \
+  --expt-relaxed-constexpr \
+  -lineinfo \
+  -ftemplate-backtrace-limit=0 \
+  -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 \
+  -DCUTLASS_ENABLE_GDC_FOR_SM100=1"
+
+INCLUDES="-I$CUTLASS_DIR/include \
+  -I$CUTLASS_DIR/tools/util/include \
+  -I$CUTLASS_DIR/examples/common"</pre>
+
+<!-- ─── Step 5 ─── -->
+<h3><span class="step-num">5</span> Build example 48 (TF32 GEMM, re-built in clean tree)</h3>
+
+<pre>nvcc $NVCC_FLAGS $INCLUDES \
+  -I$CUTLASS_DIR/examples/48_hopper_warp_specialized_gemm \
+  $CUTLASS_DIR/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm.cu \
+  -o $BUILD_DIR/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm \
+  -lcuda</pre>
+
+<!-- ─── Step 6 ─── -->
+<h3><span class="step-num">6</span> Build example 70 (FP16 GEMM)</h3>
+
+<pre>nvcc $NVCC_FLAGS $INCLUDES \
+  -I$CUTLASS_DIR/examples/70_blackwell_gemm \
+  $CUTLASS_DIR/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu \
+  -o $BUILD_DIR/examples/70_blackwell_gemm/70_blackwell_fp16_gemm \
+  -lcuda</pre>
+
+<p>Key flags (same for both examples):</p>
+<table>
+  <tr><th>Flag</th><th>Purpose</th></tr>
+  <tr>
+    <td><code>--generate-code=arch=compute_110a,code=[sm_110a,compute_110a]</code></td>
+    <td>Produces a native SM 11.0a cubin plus embedded PTX for forward compatibility.
+        The <code>110a</code> variant sets <code>__CUDA_ARCH_FEAT_SM110_ALL</code>,
+        activating TCGEN05 MMA and TMA device-side guards inside CUTLASS headers.</td>
+  </tr>
+  <tr>
+    <td><code>--expt-relaxed-constexpr</code></td>
+    <td>Required by CUTLASS's heavy use of <code>constexpr</code> in device code.</td>
+  </tr>
+  <tr>
+    <td><code>-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1</code></td>
+    <td>Enables tensor-core (TCGEN05 / UMMA) MMA paths in CUTLASS.</td>
+  </tr>
+  <tr>
+    <td><code>-DCUTLASS_ENABLE_GDC_FOR_SM100=1</code></td>
+    <td>Enables Grid Dependency Control used by the SM 100/110 persistent tile scheduler.</td>
+  </tr>
+  <tr>
+    <td><code>-I$CUTLASS_DIR/examples/common</code></td>
+    <td>Provides <code>helper.h</code> (GPU timer, CUDA/CUTLASS error-check macros).</td>
+  </tr>
+  <tr>
+    <td><code>-lcuda</code></td>
+    <td>Links the CUDA driver library (needed for TMA descriptor APIs).</td>
+  </tr>
+</table>
+
+<!-- ─── Step 7 ─── -->
+<h3><span class="step-num">7</span> Run the examples</h3>
+
+<pre><span class="comment"># Example 48 — TF32 GEMM</span>
+$BUILD_DIR/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm
+$BUILD_DIR/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm \
+  --m=2048 --n=2048 --k=2048 --rasterization=N --swizzle=2
+
+<span class="comment"># Example 70 — FP16 GEMM</span>
+$BUILD_DIR/examples/70_blackwell_gemm/70_blackwell_fp16_gemm
+$BUILD_DIR/examples/70_blackwell_gemm/70_blackwell_fp16_gemm \
+  --m=4096 --n=4096 --k=4096 --swizzle=2</pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Results</h2>
+
+<div class="success">
+  <strong>All four runs passed correctness verification.</strong>
+</div>
+
+<table>
+  <tr>
+    <th>Example</th>
+    <th>Precision</th>
+    <th>Problem size (M&times;N&times;K)</th>
+    <th>Options</th>
+    <th>Avg runtime</th>
+    <th>GFLOPS</th>
+    <th>Disposition</th>
+  </tr>
+  <tr>
+    <td rowspan="2"><code>48_hopper_warp_specialized_gemm</code></td>
+    <td rowspan="2">TF32 (FP32 in, FP32 out)</td>
+    <td>5120 &times; 4096 &times; 4096</td>
+    <td>default</td>
+    <td>7.18 ms</td>
+    <td>23,934</td>
+    <td>&#10003; Passed</td>
+  </tr>
+  <tr>
+    <td>2048 &times; 2048 &times; 2048</td>
+    <td><code>--rasterization=N --swizzle=2</code></td>
+    <td>0.297 ms</td>
+    <td>57,770</td>
+    <td>&#10003; Passed</td>
+  </tr>
+  <tr>
+    <td rowspan="2"><code>70_blackwell_fp16_gemm</code></td>
+    <td rowspan="2">FP16 (FP16 in, FP32 out)</td>
+    <td>8192 &times; 8192 &times; 8192</td>
+    <td>default</td>
+    <td>29.78 ms</td>
+    <td>36,918</td>
+    <td>&#10003; Passed</td>
+  </tr>
+  <tr>
+    <td>4096 &times; 4096 &times; 4096</td>
+    <td><code>--swizzle=2</code></td>
+    <td>1.77 ms</td>
+    <td>77,814</td>
+    <td>&#10003; Passed</td>
+  </tr>
+</table>
+
+<p>
+  FP16 GEMM (example 70) achieves roughly <strong>2&times; higher GFLOPS</strong> than
+  TF32 GEMM (example 48) at comparable problem sizes, consistent with the TCGEN05
+  instruction throughput advantage of FP16 over TF32 on SM 11.0.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Comparison: Example 48 vs Example 70</h2>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>Example 48 (TF32 GEMM)</th>
+    <th>Example 70 (FP16 GEMM)</th>
+  </tr>
+  <tr>
+    <td>Original target arch</td>
+    <td>SM 90 (Hopper, GMMA)</td>
+    <td>SM 100 (Blackwell, TCGEN05)</td>
+  </tr>
+  <tr>
+    <td>Input element type</td>
+    <td><code>float</code> (converted to TF32 by TMA)</td>
+    <td><code>half_t</code> (FP16)</td>
+  </tr>
+  <tr>
+    <td>Output element type</td>
+    <td><code>float</code></td>
+    <td><code>float</code></td>
+  </tr>
+  <tr>
+    <td>MMA tile shape</td>
+    <td><code>Shape&lt;_256,_128,_64&gt;</code> (after patch)</td>
+    <td><code>Shape&lt;_256,_128,_64&gt;</code></td>
+  </tr>
+  <tr>
+    <td>Cluster shape</td>
+    <td><code>Shape&lt;_2,_2,_1&gt;</code> (after patch)</td>
+    <td><code>Shape&lt;_2,_2,_1&gt;</code></td>
+  </tr>
+  <tr>
+    <td>Source patches for SM 11.0</td>
+    <td>7 changes (arch tag, tile shape, guard macros, problem shape, arguments, arch check)</td>
+    <td><strong>1 change</strong> (runtime arch check only)</td>
+  </tr>
+  <tr>
+    <td>Compile target</td>
+    <td><code>sm_110a</code></td>
+    <td><code>sm_110a</code></td>
+  </tr>
+  <tr>
+    <td>Compile flags</td>
+    <td colspan="2">Identical &mdash; see Step 4</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>File Locations</h2>
+
+<table>
+  <tr><th>File</th><th>Description</th></tr>
+  <tr>
+    <td><code>cutlass/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu</code></td>
+    <td>Patched source (1-line arch check fix)</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/70_blackwell_gemm/70_blackwell_fp16_gemm.cu.bak</code></td>
+    <td>Original unmodified source</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm.cu</code></td>
+    <td>Patched source for example 48 (unchanged from previous report)</td>
+  </tr>
+  <tr>
+    <td><code>build_sm110/examples/70_blackwell_gemm/70_blackwell_fp16_gemm</code></td>
+    <td>Compiled binary for example 70</td>
+  </tr>
+  <tr>
+    <td><code>build_sm110/examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm</code></td>
+    <td>Compiled binary for example 48 (re-built in clean tree)</td>
+  </tr>
+</table>
+
+</body>
+</html>

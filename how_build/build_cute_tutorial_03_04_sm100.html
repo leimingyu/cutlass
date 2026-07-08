@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Build Report: CuTe Tutorial 03 &amp; 04 (SM100) on NVIDIA Thor (SM 11.0)</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         max-width: 960px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; line-height: 1.65; }
+  h1 { font-size: 1.6em; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+  h2 { font-size: 1.2em; margin-top: 2.2em; color: #2c3e50; border-left: 4px solid #2c3e50; padding-left: 10px; }
+  h3 { font-size: 1.05em; margin-top: 1.6em; color: #444; }
+  code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px;
+         font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.88em; }
+  pre  { background: #1e1e2e; color: #cdd6f4; padding: 16px 20px; border-radius: 6px;
+         overflow-x: auto; font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+         font-size: 0.85em; line-height: 1.55; margin: 1em 0; }
+  pre .comment { color: #6c7086; }
+  pre .flag    { color: #89dceb; }
+  table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.93em; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #2c3e50; color: #fff; }
+  tr:nth-child(even) { background: #f9f9f9; }
+  .note    { background: #fff8e1; border-left: 4px solid #f0ad4e; padding: 10px 16px; margin: 1em 0; font-size: 0.95em; }
+  .success { background: #e8f5e9; border-left: 4px solid #43a047; padding: 10px 16px; margin: 1em 0; font-size: 0.95em; }
+  .diff-add { color: #a6e3a1; }
+  .diff-del { color: #f38ba8; }
+  .diff-hdr { color: #89b4fa; }
+  .step-num { display: inline-block; background: #2c3e50; color: #fff; border-radius: 50%;
+              width: 24px; height: 24px; text-align: center; line-height: 24px;
+              font-size: 0.85em; font-weight: bold; margin-right: 8px; vertical-align: middle; }
+  ul { padding-left: 1.4em; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Build Report: CuTe Tutorial 03 &amp; 04 (SM100) on NVIDIA Thor (SM 11.0)</h1>
+
+<p>
+  This report documents building and running two CuTe tutorial examples for the Blackwell SM100
+  architecture on an <strong>NVIDIA Thor GPU (SM 11.0)</strong> using CUDA 13.1, placed in the
+  shared <code>build_sm110/</code> tree.
+</p>
+
+<table>
+  <tr><th>Example</th><th>File</th><th>Key feature</th></tr>
+  <tr>
+    <td><strong>Tutorial 03</strong></td>
+    <td><code>cute/tutorial/blackwell/03_mma_tma_multicast_sm100.cu</code></td>
+    <td>1-SM tcgen05.mma + TMA multicast across a cluster</td>
+  </tr>
+  <tr>
+    <td><strong>Tutorial 04</strong></td>
+    <td><code>cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu</code></td>
+    <td>2-SM tcgen05.mma + 2-SM TMA multicast (cooperative 2-CTA MMA)</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Environment</h2>
+
+<table>
+  <tr><th>Component</th><th>Version / Value</th></tr>
+  <tr><td>GPU</td><td>NVIDIA Thor &mdash; compute capability <strong>11.0</strong></td></tr>
+  <tr><td>Driver</td><td>580.00</td></tr>
+  <tr><td>CUDA Toolkit</td><td>13.1 (<code>nvcc</code> V13.1.115)</td></tr>
+  <tr><td>Build directory</td><td><code>build_sm110/examples/cute/tutorial/blackwell/</code></td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>What These Examples Do</h2>
+
+<p>
+  Both examples implement a GEMM: <code>D (F32) = &beta;&middot;C (F32) + &alpha;&middot;A (F16) &times; B (F16)</code>
+  using low-level CuTe SM100 primitives, progressively building on each other:
+</p>
+<ul>
+  <li><strong>Tutorial 03</strong> introduces <em>TMA multicast</em>: a single TMA load
+      broadcasts a tile of A (or B) to all CTAs in the cluster that share the same M (or N)
+      coordinate, eliminating redundant GMEM reads. The cluster is 4&times;4 CTAs; each CTA
+      runs a 1-SM <code>tcgen05.mma</code> (128&times;256&times;16 MMA tile).</li>
+  <li><strong>Tutorial 04</strong> adds <em>2-SM cooperative MMA</em>: pairs of CTAs
+      collaborate on a single 256&times;256&times;16 <code>tcgen05.mma</code> instruction
+      using <code>SM100_TMA_2SM_LOAD_MULTICAST</code> and <code>SM100_MMA_2SM_F16BF16_SS</code>.
+      Only the leader CTA issues the MMA; both CTAs contribute SMEM data.</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Why They Cannot Be Run Naively on SM 11.0</h2>
+
+<table>
+  <tr><th>#</th><th>Problem</th><th>Root cause</th></tr>
+  <tr>
+    <td>1</td>
+    <td>Runtime check <code>(props.major != 10) || (props.major == 10 &amp;&amp; props.minor &gt; 1)</code>
+        rejects SM 11.0.</td>
+    <td>Guard written for Blackwell SM 100 only; Thor has <code>major=11</code>.</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td><code>cudaErrorInvalidClusterSize</code> at launch: the hardcoded
+        <code>4&times;4&times;1</code> cluster (16 CTAs) exceeds SM 11.0's maximum.</td>
+    <td>SM 11.0 supports clusters up to <strong>8 CTAs</strong> (the portable limit).
+        SM 100 (Blackwell) supports up to 16 CTAs with an explicit opt-in.
+        The examples use 16 without the opt-in flag, which fails on SM 11.0.</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td>CMake 3.28 cannot generate correct arch flags for SM 11.0.</td>
+    <td>Same zero-padding issue as all previous examples; bypassed by invoking
+        <code>nvcc</code> directly.</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>No kernel-level changes needed.</strong> The TCGEN05 MMA instructions, TMA
+  multicast, and TMEM allocator used by both examples are all supported on SM 11.0a.
+  The only source changes are the runtime arch check and the cluster shape.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Maximum Cluster Size on SM 11.0</h2>
+
+<p>
+  Empirically verified by attempting cluster launches of increasing size:
+</p>
+
+<table>
+  <tr><th>Cluster size (total CTAs)</th><th>SM 11.0 result</th></tr>
+  <tr><td>1 &ndash; 8</td><td>&#10003; Launch succeeds</td></tr>
+  <tr><td>9 &ndash; 16</td><td>&#10007; <code>cudaErrorInvalidClusterSize</code></td></tr>
+</table>
+
+<p>
+  The original <code>4&times;4&times;1 = 16</code> cluster is replaced with
+  <code>2&times;2&times;1 = 4</code>, which:
+</p>
+<ul>
+  <li>Is within the SM 11.0 portable limit of 8.</li>
+  <li>Keeps the cluster M dimension a multiple of 2, satisfying the 2-SM MMA constraint
+      in tutorial 04.</li>
+  <li>Preserves the multicast semantics: A tiles are still multicast along the N-cluster
+      dimension (now 2 instead of 4), and B tiles along the M-cluster dimension (now 2).</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Step-by-Step Build Instructions</h2>
+
+<h3><span class="step-num">1</span> Patch both source files</h3>
+
+<pre><span class="comment"># Back up originals</span>
+TDIR=cutlass/examples/cute/tutorial/blackwell
+cp $TDIR/03_mma_tma_multicast_sm100.cu $TDIR/03_mma_tma_multicast_sm100.cu.bak
+cp $TDIR/04_mma_tma_2sm_sm100.cu       $TDIR/04_mma_tma_2sm_sm100.cu.bak</pre>
+
+<p>Apply the following diff to <strong>both</strong> files (line numbers differ slightly):</p>
+
+<pre><span class="diff-hdr">--- 03_mma_tma_multicast_sm100.cu.bak  (same pattern in 04_mma_tma_2sm_sm100.cu.bak)</span>
+<span class="diff-hdr">+++ 03_mma_tma_multicast_sm100.cu</span>
+
+<span class="diff-hdr">@@ cluster shape (line 524 in 03, line 526 in 04) @@</span>
+<span class="diff-del">-  auto cluster_shape = make_shape(Int&lt;4&gt;{}, Int&lt;4&gt;{}, Int&lt;1&gt;{});</span>
+<span class="diff-add">+  auto cluster_shape = make_shape(Int&lt;2&gt;{}, Int&lt;2&gt;{}, Int&lt;1&gt;{});</span>
+
+<span class="diff-hdr">@@ runtime arch check (line 615 in 03, line 622 in 04) @@</span>
+<span class="diff-del">-  if ((props.major != 10) || (props.major == 10 &amp;&amp; props.minor &gt; 1)) {</span>
+<span class="diff-del">-    std::cerr &lt;&lt; "This example requires NVIDIA's Blackwell Architecture GPU with compute capability 100a." &lt;&lt; std::endl;</span>
+<span class="diff-del">-    std::cerr &lt;&lt; "  Found " &lt;&lt; props.major &lt;&lt; "." &lt;&lt; props.minor &lt;&lt; std::endl;</span>
+<span class="diff-add">+  if (props.major &lt; 10) {</span>
+<span class="diff-add">+    std::cerr &lt;&lt; "This example requires a GPU with compute capability &gt;= 100 (SM 100 or SM 110)." &lt;&lt; std::endl;</span></pre>
+
+<h3><span class="step-num">2</span> Build</h3>
+
+<pre>CUTLASS_DIR=/home/leimyu/01_research/cutlass_dsmem/cutlass
+BUILD_DIR=/home/leimyu/01_research/cutlass_dsmem/build_sm110
+TDIR=$CUTLASS_DIR/examples/cute/tutorial/blackwell
+mkdir -p $BUILD_DIR/examples/cute/tutorial/blackwell
+
+NVCC_FLAGS="-std=c++17 -O3 \
+  <span class="flag">--generate-code=arch=compute_110a,code=[sm_110a,compute_110a]</span> \
+  --expt-relaxed-constexpr \
+  -lineinfo \
+  -ftemplate-backtrace-limit=0 \
+  -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 \
+  -DCUTLASS_ENABLE_GDC_FOR_SM100=1"
+
+INCLUDES="-I$CUTLASS_DIR/include \
+  -I$CUTLASS_DIR/tools/util/include \
+  -I$CUTLASS_DIR/examples/common \
+  -I$TDIR"
+
+<span class="comment"># Tutorial 03</span>
+nvcc $NVCC_FLAGS $INCLUDES \
+  $TDIR/03_mma_tma_multicast_sm100.cu \
+  -o $BUILD_DIR/examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100 \
+  -lcuda
+
+<span class="comment"># Tutorial 04</span>
+nvcc $NVCC_FLAGS $INCLUDES \
+  $TDIR/04_mma_tma_2sm_sm100.cu \
+  -o $BUILD_DIR/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100 \
+  -lcuda</pre>
+
+<h3><span class="step-num">3</span> Run</h3>
+
+<pre>BIN=$BUILD_DIR/examples/cute/tutorial/blackwell
+
+<span class="comment"># Tutorial 03 — default and larger problem</span>
+$BIN/03_mma_tma_multicast_sm100
+$BIN/03_mma_tma_multicast_sm100 1024 2048 512
+
+<span class="comment"># Tutorial 04 — default and larger problem</span>
+$BIN/04_mma_tma_2sm_sm100
+$BIN/04_mma_tma_2sm_sm100 1024 2048 512</pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Results</h2>
+
+<div class="success">
+  <strong>All four runs passed with zero relative error.</strong>
+</div>
+
+<table>
+  <tr>
+    <th>Example</th>
+    <th>Problem (M&times;N&times;K)</th>
+    <th>Grid</th>
+    <th>Cluster</th>
+    <th>Relative error</th>
+    <th>Result</th>
+  </tr>
+  <tr>
+    <td rowspan="2">Tutorial 03 (1-SM MMA + multicast TMA)</td>
+    <td>512 &times; 1024 &times; 256</td>
+    <td>4&times;4&times;1</td>
+    <td>2&times;2&times;1</td>
+    <td>0.000000e+00</td>
+    <td>&#10003; Successful</td>
+  </tr>
+  <tr>
+    <td>1024 &times; 2048 &times; 512</td>
+    <td>8&times;8&times;1</td>
+    <td>2&times;2&times;1</td>
+    <td>0.000000e+00</td>
+    <td>&#10003; Successful</td>
+  </tr>
+  <tr>
+    <td rowspan="2">Tutorial 04 (2-SM MMA + 2-SM multicast TMA)</td>
+    <td>512 &times; 1024 &times; 256</td>
+    <td>4&times;4&times;1</td>
+    <td>2&times;2&times;1</td>
+    <td>0.000000e+00</td>
+    <td>&#10003; Successful</td>
+  </tr>
+  <tr>
+    <td>1024 &times; 2048 &times; 512</td>
+    <td>8&times;8&times;1</td>
+    <td>2&times;2&times;1</td>
+    <td>0.000000e+00</td>
+    <td>&#10003; Successful</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Complete Summary: All Six Examples in <code>build_sm110/</code></h2>
+
+<table>
+  <tr>
+    <th>Example</th>
+    <th>Kernel type</th>
+    <th>Patches for SM 11.0</th>
+    <th>Status</th>
+  </tr>
+  <tr>
+    <td><code>48_hopper_warp_specialized_gemm</code></td>
+    <td>TF32 GEMM (SM90 → SM100 path)</td>
+    <td>7 changes (arch tag, tile/cluster shape, guard macros, problem shape, arguments, arch check)</td>
+    <td>&#10003; Fully working</td>
+  </tr>
+  <tr>
+    <td><code>70_blackwell_fp16_gemm</code></td>
+    <td>FP16 GEMM (SM100)</td>
+    <td>1 change (arch check)</td>
+    <td>&#10003; Fully working</td>
+  </tr>
+  <tr>
+    <td><code>73_blackwell_gemm_preferred_cluster</code></td>
+    <td>FP16 GEMM + dynamic preferred cluster (SM100)</td>
+    <td>1 change (arch check)</td>
+    <td>&#10003; Fully working</td>
+  </tr>
+  <tr>
+    <td><code>93_blackwell_low_latency_gqa</code></td>
+    <td>GQA flash-decode with DSMEM mailboxes (SM100)</td>
+    <td>1 change (<code>redux.sync</code> → <code>__shfl_xor_sync</code> in <code>tgv_gqa.cuh</code>)</td>
+    <td>&#9888; Works; intermittent failures with random <code>seq_lens</code> (DSMEM barrier timing on SM 11.0)</td>
+  </tr>
+  <tr>
+    <td><code>cute/tutorial/blackwell/03_mma_tma_multicast_sm100</code></td>
+    <td>1-SM tcgen05.mma + TMA multicast (CuTe tutorial)</td>
+    <td>2 changes (arch check, cluster shape 4&times;4 → 2&times;2)</td>
+    <td>&#10003; Fully working</td>
+  </tr>
+  <tr>
+    <td><code>cute/tutorial/blackwell/04_mma_tma_2sm_sm100</code></td>
+    <td>2-SM tcgen05.mma + 2-SM TMA multicast (CuTe tutorial)</td>
+    <td>2 changes (arch check, cluster shape 4&times;4 → 2&times;2)</td>
+    <td>&#10003; Fully working</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>File Locations</h2>
+
+<table>
+  <tr><th>File</th><th>Description</th></tr>
+  <tr>
+    <td><code>cutlass/examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100.cu</code></td>
+    <td>Patched source (arch check + cluster shape)</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100.cu.bak</code></td>
+    <td>Original unmodified source</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu</code></td>
+    <td>Patched source (arch check + cluster shape)</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu.bak</code></td>
+    <td>Original unmodified source</td>
+  </tr>
+  <tr>
+    <td><code>build_sm110/examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100</code></td>
+    <td>Compiled binary for tutorial 03</td>
+  </tr>
+  <tr>
+    <td><code>build_sm110/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100</code></td>
+    <td>Compiled binary for tutorial 04</td>
+  </tr>
+</table>
+
+</body>
+</html>

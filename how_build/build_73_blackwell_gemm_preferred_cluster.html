@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Build Report: 73_blackwell_gemm_preferred_cluster on NVIDIA Thor (SM 11.0)</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 40px auto;
+    padding: 0 24px;
+    color: #1a1a1a;
+    line-height: 1.65;
+  }
+  h1 { font-size: 1.6em; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+  h2 {
+    font-size: 1.2em; margin-top: 2.2em; color: #2c3e50;
+    border-left: 4px solid #2c3e50; padding-left: 10px;
+  }
+  h3 { font-size: 1.05em; margin-top: 1.6em; color: #444; }
+  code {
+    background: #f4f4f4; padding: 2px 5px; border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.88em;
+  }
+  pre {
+    background: #1e1e2e; color: #cdd6f4; padding: 16px 20px; border-radius: 6px;
+    overflow-x: auto; font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    font-size: 0.85em; line-height: 1.55; margin: 1em 0;
+  }
+  pre .comment { color: #6c7086; }
+  pre .flag    { color: #89dceb; }
+  table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.93em; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #2c3e50; color: #fff; }
+  tr:nth-child(even) { background: #f9f9f9; }
+  .note {
+    background: #fff8e1; border-left: 4px solid #f0ad4e;
+    padding: 10px 16px; margin: 1em 0; font-size: 0.95em;
+  }
+  .success {
+    background: #e8f5e9; border-left: 4px solid #43a047;
+    padding: 10px 16px; margin: 1em 0; font-size: 0.95em;
+  }
+  .warn {
+    background: #fce4ec; border-left: 4px solid #e53935;
+    padding: 10px 16px; margin: 1em 0; font-size: 0.95em;
+  }
+  .diff-add { color: #a6e3a1; }
+  .diff-del { color: #f38ba8; }
+  .diff-hdr { color: #89b4fa; }
+  .step-num {
+    display: inline-block; background: #2c3e50; color: #fff;
+    border-radius: 50%; width: 24px; height: 24px; text-align: center;
+    line-height: 24px; font-size: 0.85em; font-weight: bold;
+    margin-right: 8px; vertical-align: middle;
+  }
+  ul { padding-left: 1.4em; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Build Report: <code>73_blackwell_gemm_preferred_cluster</code> on NVIDIA Thor (SM 11.0)</h1>
+
+<p>
+  This report documents building and running
+  <code>cutlass/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu</code>
+  on an <strong>NVIDIA Thor GPU (SM 11.0)</strong> using CUDA 13.1, placed in the shared
+  <code>build_sm110/</code> tree alongside examples 48 and 70.
+</p>
+
+<p>
+  This example demonstrates <strong>Preferred Dynamic Clusters</strong> introduced in
+  CUTLASS 3.8 for SM 100+: the ability to specify a <em>preferred</em> cluster shape and a
+  <em>fallback</em> cluster shape at runtime, so the scheduler can use the larger cluster
+  where SM occupancy allows and fall back to the smaller one for the remainder.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Environment</h2>
+
+<table>
+  <tr><th>Component</th><th>Version / Value</th></tr>
+  <tr><td>GPU</td><td>NVIDIA Thor &mdash; compute capability <strong>11.0</strong></td></tr>
+  <tr><td>Driver</td><td>580.00</td></tr>
+  <tr><td>CUDA Toolkit</td><td>13.1 (<code>nvcc</code> V13.1.115)</td></tr>
+  <tr><td>CMake</td><td>3.28.3</td></tr>
+  <tr><td>CUTLASS source</td><td><code>cutlass/</code></td></tr>
+  <tr><td>Build directory</td><td><code>build_sm110/</code> (shared with examples 48 and 70)</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>What This Example Does</h2>
+
+<p>
+  The kernel uses a <strong>dynamic cluster shape</strong>
+  (<code>ClusterShape_MNK = Shape&lt;int,int,_1&gt;</code>) so that the M and N cluster
+  dimensions are set at runtime rather than baked into the template.
+  Two shapes are passed via <code>arguments.hw_info</code>:
+</p>
+<ul>
+  <li><strong>Preferred cluster</strong> — the larger shape the scheduler tries first
+      (e.g. <code>4&times;4&times;1</code>).</li>
+  <li><strong>Fallback cluster</strong> — the smaller shape used for leftover SMs
+      (e.g. <code>2&times;1&times;1</code>).</li>
+</ul>
+<p>
+  The kernel schedule is explicitly set to
+  <code>KernelTmaWarpSpecialized2SmSm100</code> / <code>TmaWarpSpecialized2Sm</code>
+  (2-SM cooperative MMA) because <code>KernelScheduleAuto</code> would conservatively
+  select 1-SM MMA when it sees a dynamic cluster shape.
+</p>
+
+<div class="note">
+  <strong>Cluster shape constraints</strong> enforced by <code>can_implement()</code>:
+  <ul>
+    <li>Preferred cluster depth (Z) must equal fallback cluster depth.</li>
+    <li>Fallback shape must evenly divide preferred shape.</li>
+    <li>Because the kernel uses 2-SM MMA, the cluster M dimension must always be
+        a multiple of 2 — both preferred <em>and</em> fallback.</li>
+  </ul>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Why It Cannot Be Run Naively on SM 11.0</h2>
+
+<table>
+  <tr><th>#</th><th>Problem</th><th>Root cause</th></tr>
+  <tr>
+    <td>1</td>
+    <td>Runtime check <code>props.major != 10 || props.minor != 0</code> rejects SM 11.0.</td>
+    <td>Guard written for Blackwell SM 100 only; Thor has <code>major=11</code>.</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>CMake 3.28 cannot generate correct arch flags for SM 11.0.</td>
+    <td>Same zero-padding issue as examples 48 and 70; bypassed by invoking
+        <code>nvcc</code> directly.</td>
+  </tr>
+</table>
+
+<div class="note">
+  The CUDA version check (<code>&lt; 12.8</code>) and all kernel template types
+  (<code>Sm100</code>, <code>Shape&lt;int,int,int,int&gt;</code>, dynamic cluster shape,
+  <code>KernelTmaWarpSpecialized2SmSm100</code>) are already correct for SM 11.0 —
+  <strong>no template changes are needed</strong>.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Step-by-Step Build Instructions</h2>
+
+<h3><span class="step-num">1</span> Patch the source</h3>
+
+<pre><span class="comment"># Back up</span>
+cp cutlass/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu \
+   cutlass/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu.bak</pre>
+
+<p>Apply the single runtime-check fix:</p>
+
+<pre><span class="diff-hdr">--- blackwell_gemm_preferred_cluster.cu.bak</span>
+<span class="diff-hdr">+++ blackwell_gemm_preferred_cluster.cu</span>
+
+<span class="diff-hdr">@@ line 515 — runtime arch check @@</span>
+<span class="diff-del">-  if (props.major != 10 || props.minor != 0) {</span>
+<span class="diff-del">-    std::cerr &lt;&lt; "This example requires a GPU with compute capability 100a)." &lt;&lt; std::endl;</span>
+<span class="diff-add">+  if (props.major &lt; 10) {</span>
+<span class="diff-add">+    std::cerr &lt;&lt; "This example requires a GPU with compute capability &gt;= 100 (SM 100 or SM 110)." &lt;&lt; std::endl;</span></pre>
+
+<h3><span class="step-num">2</span> Build</h3>
+
+<pre>CUTLASS_DIR=/home/leimyu/01_research/cutlass_dsmem/cutlass
+BUILD_DIR=/home/leimyu/01_research/cutlass_dsmem/build_sm110
+mkdir -p $BUILD_DIR/examples/73_blackwell_gemm_preferred_cluster
+
+nvcc \
+  -std=c++17 -O3 \
+  <span class="flag">--generate-code=arch=compute_110a,code=[sm_110a,compute_110a]</span> \
+  --expt-relaxed-constexpr \
+  -lineinfo \
+  -ftemplate-backtrace-limit=0 \
+  -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 \
+  -DCUTLASS_ENABLE_GDC_FOR_SM100=1 \
+  -I$CUTLASS_DIR/include \
+  -I$CUTLASS_DIR/tools/util/include \
+  -I$CUTLASS_DIR/examples/common \
+  -I$CUTLASS_DIR/examples/73_blackwell_gemm_preferred_cluster \
+  $CUTLASS_DIR/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu \
+  -o $BUILD_DIR/examples/73_blackwell_gemm_preferred_cluster/73_blackwell_gemm_preferred_cluster \
+  -lcuda</pre>
+
+<h3><span class="step-num">3</span> Run</h3>
+
+<pre>BIN=$BUILD_DIR/examples/73_blackwell_gemm_preferred_cluster/73_blackwell_gemm_preferred_cluster
+
+<span class="comment"># Default: preferred=4x4, fallback=2x1</span>
+$BIN
+
+<span class="comment"># Larger problem, preferred=4x2, fallback=2x1, swizzle=2</span>
+$BIN --m=8192 --n=8192 --k=4096 \
+  --preferred_cluster_m=4 --preferred_cluster_n=2 \
+  --fallback_cluster_m=2  --fallback_cluster_n=1 \
+  --swizzle=2
+
+<span class="comment"># Smaller preferred cluster: preferred=2x2, fallback=2x1</span>
+$BIN --m=4096 --n=4096 --k=4096 \
+  --preferred_cluster_m=2 --preferred_cluster_n=2 \
+  --fallback_cluster_m=2  --fallback_cluster_n=1</pre>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Results</h2>
+
+<div class="success">
+  <strong>All valid runs passed correctness verification.</strong>
+</div>
+
+<table>
+  <tr>
+    <th>Problem (M&times;N&times;K)</th>
+    <th>Preferred cluster</th>
+    <th>Fallback cluster</th>
+    <th>Swizzle</th>
+    <th>Avg runtime</th>
+    <th>GFLOPS</th>
+    <th>Disposition</th>
+  </tr>
+  <tr>
+    <td>4096 &times; 4096 &times; 4096</td>
+    <td>4&times;4&times;1</td>
+    <td>2&times;1&times;1</td>
+    <td>0</td>
+    <td>1.82 ms</td>
+    <td>75,448</td>
+    <td>&#10003; Passed</td>
+  </tr>
+  <tr>
+    <td>4096 &times; 4096 &times; 4096</td>
+    <td>2&times;2&times;1</td>
+    <td>2&times;1&times;1</td>
+    <td>0</td>
+    <td>2.98 ms</td>
+    <td>46,180</td>
+    <td>&#10003; Passed</td>
+  </tr>
+  <tr>
+    <td>8192 &times; 8192 &times; 4096</td>
+    <td>4&times;2&times;1</td>
+    <td>2&times;1&times;1</td>
+    <td>2</td>
+    <td>8.83 ms</td>
+    <td>62,246</td>
+    <td>&#10003; Passed</td>
+  </tr>
+</table>
+
+<div class="warn">
+  <strong>Invalid cluster shape combination — expected failure:</strong>
+  <code>preferred=2&times;2, fallback=1&times;1</code> is rejected by
+  <code>gemm.can_implement()</code> with <em>"Invalid status"</em>.
+  The kernel uses <code>KernelTmaWarpSpecialized2SmSm100</code> (2-SM cooperative MMA),
+  which requires the cluster M dimension to be a multiple of 2 for <em>both</em>
+  preferred and fallback shapes. A fallback M=1 violates this constraint.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Comparison Across All Three Examples in <code>build_sm110/</code></h2>
+
+<table>
+  <tr>
+    <th>Example</th>
+    <th>Precision</th>
+    <th>Cluster shape</th>
+    <th>Kernel schedule</th>
+    <th>Source patches for SM 11.0</th>
+  </tr>
+  <tr>
+    <td><code>48_hopper_warp_specialized_gemm</code></td>
+    <td>TF32 (FP32 in/out)</td>
+    <td>Static <code>2&times;2&times;1</code></td>
+    <td><code>KernelScheduleAuto</code> &rarr; SM100 2-SM</td>
+    <td>7 changes (arch tag, tile/cluster shape, guard macros, problem shape, arguments, arch check)</td>
+  </tr>
+  <tr>
+    <td><code>70_blackwell_fp16_gemm</code></td>
+    <td>FP16 in, FP32 out</td>
+    <td>Static <code>2&times;2&times;1</code></td>
+    <td><code>KernelScheduleAuto</code> &rarr; SM100 2-SM</td>
+    <td>1 change (arch check only)</td>
+  </tr>
+  <tr>
+    <td><code>73_blackwell_gemm_preferred_cluster</code></td>
+    <td>FP16 in, FP32 out</td>
+    <td>Dynamic <code>int&times;int&times;1</code> + preferred/fallback at runtime</td>
+    <td>Explicit <code>KernelTmaWarpSpecialized2SmSm100</code></td>
+    <td>1 change (arch check only)</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>File Locations</h2>
+
+<table>
+  <tr><th>File</th><th>Description</th></tr>
+  <tr>
+    <td><code>cutlass/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu</code></td>
+    <td>Patched source (1-line arch check fix)</td>
+  </tr>
+  <tr>
+    <td><code>cutlass/examples/73_blackwell_gemm_preferred_cluster/blackwell_gemm_preferred_cluster.cu.bak</code></td>
+    <td>Original unmodified source</td>
+  </tr>
+  <tr>
+    <td><code>build_sm110/examples/73_blackwell_gemm_preferred_cluster/73_blackwell_gemm_preferred_cluster</code></td>
+    <td>Compiled binary</td>
+  </tr>
+</table>
+
+</body>
+</html>
