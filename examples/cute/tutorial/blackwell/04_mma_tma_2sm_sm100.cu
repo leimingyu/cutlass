@@ -523,7 +523,7 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   //
 
   // The cluster shape and layout
-  auto cluster_shape = make_shape(Int<4>{}, Int<4>{}, Int<1>{});
+  auto cluster_shape = make_shape(Int<2>{}, Int<2>{}, Int<1>{});
   Layout cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape),
                                             make_tile(typename decltype(tiled_mma)::AtomThrID{}));
 
@@ -619,8 +619,8 @@ int main(int argc, char** argv)
     return -1;
   }
 
-  if ((props.major != 10) || (props.major == 10 && props.minor > 1)) {
-    std::cerr << "This example requires NVIDIA's Blackwell Architecture GPU with compute capability 100a." << std::endl;
+  if (props.major < 10) {
+    std::cerr << "This example requires a GPU with compute capability >= 100 (SM 100 or SM 110)." << std::endl;
     std::cerr << "  Found " << props.major << "." << props.minor << std::endl;
     return -1;
   }
