@@ -1,0 +1,17 @@
+# The cutlass root .gitignore has /build* which ignores this entire directory.
+# Use "git add -f" to force-track the files that should be committed:
+#   git add -f cutlass/build_sm110/.gitignore
+#   git add -f cutlass/build_sm110/build.sh
+#   git add -f cutlass/build_sm110/examples/dump_ptx_sass.sh
+#   git add -f cutlass/build_sm110/examples/70_blackwell_gemm/dump_ptx_sass.sh
+#
+# Everything below is ignored even after force-adding the directory,
+# so compiled binaries are never accidentally staged.
+
+# Compiled binaries (no extension)
+examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm
+examples/70_blackwell_gemm/70_blackwell_fp16_gemm
+examples/73_blackwell_gemm_preferred_cluster/73_blackwell_gemm_preferred_cluster
+examples/93_blackwell_low_latency_gqa/93_blackwell_low_latency_gqa
+examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100
+examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100
