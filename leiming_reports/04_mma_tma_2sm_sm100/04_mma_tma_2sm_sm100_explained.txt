@@ -1,0 +1,425 @@
+================================================================================
+CuTe Blackwell Tutorial 04 — 2SM tcgen05.mma + 2SM Multicast TMA GEMM
+File: examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu
+================================================================================
+
+Audience: someone learning CuTe on NVIDIA Blackwell (SM100). This walks the file
+top-to-bottom, explains every new SM100 concept it introduces, and grounds every
+abstract shape in the concrete numbers printed by the example for the default
+problem size (M=512, N=1024, K=256).
+
+--------------------------------------------------------------------------------
+0. WHERE THIS SITS IN THE TUTORIAL SERIES
+--------------------------------------------------------------------------------
+The blackwell/ folder is a 5-step ladder, each step adding one capability:
+
+  01_mma_sm100.cu            Bare tcgen05.mma. A/B loaded by hand (no TMA).
+  02_mma_tma_sm100.cu        Adds TMA (Tensor Memory Accelerator) for GMEM->SMEM.
+  03_mma_tma_multicast_sm100 Adds TMA *multicast*: one GMEM read feeds many CTAs.
+  04_mma_tma_2sm_sm100.cu    <-- THIS FILE. Adds 2SM MMA and 2SM (paired) TMA.
+  05_mma_tma_epi_sm100.cu    Adds a TMA epilogue (store D via TMA).
+
+So the *only* new idea in tutorial 04 versus 03 is: two CTAs (thread blocks) now
+cooperate on a single logical MMA. That one idea ripples through the MMA atom, the
+TMA atoms, the multicast masks, the barriers, and the TMEM allocator. Everything
+else (the GEMM math, the epilogue, the host harness) is essentially the same.
+
+--------------------------------------------------------------------------------
+1. THE MATH BEING COMPUTED
+--------------------------------------------------------------------------------
+    D (f32) = alpha * (A (f16) * B (f16)) + beta * C (f32)
+
+Matrix layouts (see main() and gemm_host, lines 658-669):
+  A : M x K, K-major   -> row-major, stride (K, 1)      "T"
+  B : N x K, K-major   -> column-major w.r.t. NxK       "N"
+  C : M x N, N-major   -> row-major, stride (N, 1)       "T"
+  D : M x N, N-major   -> row-major, stride (N, 1)       "T"
+
+This is the classic "TN" GEMM shape used by tensor cores: both A and B are stored
+K-major so the contraction dimension K is contiguous. The reference kernel
+(example_utils.hpp:41) makes this explicit: it computes
+    c += tensor_A(m,k) * tensor_B(n,k)
+i.e. B is indexed (n,k), confirming B is NxK.
+
+Data types (main, lines 648-656):
+  TypeA = TypeB = cutlass::half_t   (F16 inputs)
+  TypeC = TypeD = float             (F32 output)
+  TypeAccumulator = float           (F32 accumulate)
+
+Default problem: M=512, N=1024, K=256 (overridable via argv[1..3]).
+alpha = 1.0, beta = 0.0 (so C is effectively ignored numerically, but the C read
+path is still exercised).
+
+--------------------------------------------------------------------------------
+2. THE BLACKWELL HARDWARE CONCEPTS YOU MUST HOLD IN YOUR HEAD
+--------------------------------------------------------------------------------
+tcgen05.mma  : Blackwell's 5th-gen tensor-core MMA instruction. Unlike Hopper's
+               warpgroup MMA (wgmma), it is issued by a SINGLE thread and runs
+               asynchronously on a dedicated tensor-core unit.
+
+TMEM (Tensor Memory) : A NEW, separate on-chip memory on SM100 that holds MMA
+               accumulators. On Blackwell the MMA writes its result to TMEM, NOT
+               to registers. You must explicitly (a) allocate TMEM, (b) after the
+               mainloop copy TMEM->RMEM with tcgen05.ld, and (c) free TMEM.
+
+SMEM descriptors : tcgen05.mma reads A and B from shared memory via 64-bit
+               "SMEM descriptors" (encode base addr, swizzle, layout). CuTe hides
+               these behind "fragments" (tCrA, tCrB) that are really descriptor
+               iterators, not register data.
+
+Cluster : A group of CTAs (thread blocks) co-scheduled on neighboring SMs that can
+               access each other's SMEM (Distributed Shared Memory) and be
+               targeted together by TMA multicast. This example uses a 4x4 cluster
+               (16 CTAs), launched via cutlass::launch_kernel_on_cluster.
+
+TMA (Tensor Memory Accelerator) : Hardware DMA engine that copies tiles between
+               GMEM and SMEM using a descriptor built on the host. It is issued by
+               ONE thread, runs async, and signals completion via an mbarrier.
+
+Multicast TMA : One TMA load whose result is broadcast into the SMEM of several
+               CTAs in the cluster at once — so a GMEM tile read once is shared by
+               all CTAs that need it. Saves DRAM bandwidth.
+
+2SM MMA (the star of tutorial 04) : A single logical MMA spanning TWO CTAs. The
+               MMA instruction reads A/B halves living in the SMEM of BOTH CTAs and
+               writes an accumulator spanning both CTAs' TMEM. Terminology used in
+               the file:
+                 - "peer CTAs" : the 2 CTAs that jointly perform one MMA.
+                 - "leader CTA": the one of the pair that actually issues the
+                   tcgen05.mma instruction and waits on the TMA barrier.
+               This is why the MMA atom is named SM100_MMA_F16BF16_2x1SM_SS and the
+               TMA op is SM100_TMA_2SM_LOAD_MULTICAST.
+
+--------------------------------------------------------------------------------
+3. HOST SIDE — gemm_host_f16xf16_f32_f32_tnt (lines 412-606)
+--------------------------------------------------------------------------------
+This function builds every compile-time object the kernel needs, then launches it.
+
+3.1 Wrap raw device pointers as CuTe tensors (lines 430-433)
+    make_tensor(make_gmem_ptr(ptr), layout) gives mA, mB, mC, mD — logical views
+    over device memory.
+
+3.2 Build the TiledMMA (lines 450-464)
+    make_tiled_mma(SM100_MMA_F16BF16_2x1SM_SS<half,half,float, 256,256,
+                   UMMA::Major::K, UMMA::Major::K>{})
+    - "F16BF16" : the F16/BF16 tcgen05.mma family.
+    - "2x1SM"   : 2 SMs collaborate along M, 1 along N -> a 2SM MMA. THIS is the
+                  2SM part. (Contrast tutorial 03 which used a 1SM atom.)
+    - "SS"      : both A and B come from Shared memory (S,S). (There is also a "TS"
+                  variant where A comes from TMEM.)
+    - 256, 256  : the MMA's logical M and N tile.
+    - Major::K, Major::K : A and B are K-major in SMEM.
+    Printed atom info: Shape_MNK = (256,256,16). The instruction's K is fixed at 16
+    for 16-bit types. ThrID = _2:_1  -> two "threads" here means two CTAs.
+
+3.3 Build the MMA tiler (lines 467-470)
+    bM = tile_size<0> = 256   (M of one MMA tile)
+    bN = tile_size<1> = 256   (N of one MMA tile)
+    bK = tile_size<2> * 4 = 16 * 4 = 64   (stack 4 K16 MMAs per K tile)
+    mma_tiler = (256, 256, 64)
+    Key SM90-vs-SM100 note (lines 472-476): on SM90 you tile the problem per-CTA;
+    on SM100 you tile per-MMA (which is cluster-local), and the MMA's own
+    partitioning then hands each CTA its slice. So the "tiler" is an MMA tiler, not
+    a CTA tiler.
+
+3.4 Sanity checks (lines 478-486)
+    - MMA shape must evenly divide the MMA tiler.
+    - The MMA tiler must evenly divide the problem — this example does NOT handle
+      out-of-bounds / predication, so M,N,K must be exact multiples.
+
+3.5 Determine SMEM layouts (lines 499-516)
+    partition_shape_A/B convert a pre-partitioned (MmaTile_M, MmaTile_K) tile into
+    the post-partitioned (MmaAtomShape, NumMma_M, NumMma_K) that each CTA stores.
+      mma_shape_A = ((128,16), 1, 4)   -> note 128, not 256: each of the 2 peer
+                                          CTAs holds HALF of the 256-row A tile.
+      mma_shape_B = ((256,16), 1, 4)
+    Then tile_to_mma_shape wraps these in a 128-byte SWIZZLE atom
+    (UMMA::Layout_K_SW128_Atom) so tensor-core accesses avoid SMEM bank conflicts:
+      sA_layout = Sw<3,4,3> o ((128,16),1,4):((64,1),0,16)
+      sB_layout = Sw<3,4,3> o ((256,16),1,4):((64,1),0,16)
+    Writing swizzled layouts by hand is painful; CuTe generates them for you.
+
+3.6 SharedStorage type (line 519)
+    SharedStorage<TypeA,TypeB,sA_layout,sB_layout> — its sizeof gives the dynamic
+    SMEM bytes to request at launch.
+
+3.7 Cluster shape & layout (lines 526-528)
+    cluster_shape = (4, 4, 1)  -> 16 CTAs per cluster.
+    cluster_layout_vmnk = tiled_divide(cluster_layout, AtomThrID) splits the M
+    dimension by the MMA's AtomThrID (=2), producing a (V, M, N, K) view where:
+      V = the "value"/peer axis of size 2 (which half of a 2SM pair a CTA is),
+      M = 2 (cluster M after removing the peer factor: 4/2),
+      N = 4, K = 1.
+    This VMNK decomposition is the whole trick that lets the code address "which
+    peer am I" (V) separately from "which MMA tile am I" (M,N,K).
+
+3.8 TMA atoms (lines 531-566)
+    make_tma_atom_A_sm100(SM100_TMA_2SM_LOAD_MULTICAST{}, mA, sA_layout,
+                          mma_tiler, tiled_mma, cluster_layout_vmnk)
+    - SM100_TMA_2SM_LOAD_MULTICAST : a 2SM, multicasting TMA load.
+    - Unlike the SM90 API, the SM100 API takes the FULL mma_tiler (M,N,K), the
+      TiledMMA, and the whole cluster layout — because the atom itself now figures
+      out the multicast dimension (A multicasts along cluster-N, B along cluster-M).
+    get_tma_tensor(shape(mA)) returns mA_tma, an ArithTuple-backed "TMA tensor"
+    whose coordinates the kernel feeds to TMA copies.
+    Printed atom: ThrID _2:_1 (2SM), ValueType 16b, ValLayout (_2, _8192): each of
+    the 2 CTAs contributes an 8192-element chunk.
+
+3.9 Launch geometry (lines 574-601)
+    dimBlock  = 128 threads/CTA (one warpgroup — but MMA/TMA are issued by a single
+                elected thread; the 128 threads mostly matter for the epilogue copy).
+    dimCluster= (4,4,1).
+    dimGrid.x = ceil_div(M, bM * cluster_M) * cluster.x
+    dimGrid.y = ceil_div(N, bN * cluster_N) * cluster.y
+    Note bM*size<1>(cluster_layout_vmnk) = 256*2 = 512 (=M), and
+         bN*size<2>(...)                 = 256*4 = 1024 (=N),
+    so for the default problem exactly one cluster covers the whole output; the
+    grid is exactly one 4x4 cluster.
+    cudaFuncSetAttribute raises the dynamic SMEM cap to sizeof(SharedStorage).
+    cutlass::launch_kernel_on_cluster does the cooperative cluster launch.
+
+--------------------------------------------------------------------------------
+4. THE SHARED STORAGE STRUCT (lines 124-140)
+--------------------------------------------------------------------------------
+  struct SharedStorage {
+    alignas(128) ArrayEngine<TypeA, cosize(ASmemLayout)> A;   // A tile in SMEM
+    alignas(128) ArrayEngine<TypeB, cosize(BSmemLayout)> B;   // B tile in SMEM
+    alignas(16)  uint64_t mma_barrier;   // signals "MMA done, SMEM reusable"
+    alignas(16)  uint64_t tma_barrier;   // signals "TMA load landed in SMEM"
+    alignas(16)  uint32_t tmem_base_ptr; // TMEM allocation handle
+    tensor_sA(), tensor_sB();            // helpers -> CuTe tensors over A/B
+  };
+- The two uint64_t are mbarriers (hardware SMEM barriers) — one per async engine.
+- 128-byte alignment on A/B is required by the swizzle + TMA.
+- tmem_base_ptr is written by the TMEM allocator and read back as the accumulator's
+  address.
+
+--------------------------------------------------------------------------------
+5. THE DEVICE KERNEL — gemm_device (lines 142-410)
+--------------------------------------------------------------------------------
+Three phases: Prologue (setup), Mainloop (load+MMA over K), Epilogue (TMEM->GMEM).
+
+===== 5.1 PROLOGUE (lines 161-327) =====
+
+(a) Locate this CTA in the MMA grid (lines 163-184)
+    cluster_layout_vmnk is rebuilt on device (same as host).
+    mma_coord_vmnk = (peer, mma_M, mma_N, _) derived from blockIdx:
+      V (peer)  = blockIdx.x % clusterVsize
+      M (mma_M) = blockIdx.x / clusterVsize
+      N (mma_N) = blockIdx.y
+      K         = _ (all K tiles — sliced later in the loop)
+    local_tile then carves each global tensor down to this MMA tile, using a Step
+    projection to drop the mode that a given tensor doesn't have:
+      gA = local_tile(mA, tiler, coord, Step<1,X,1>)  -> (256,64,Tiles_K)=(128,64,4)*
+      gB = local_tile(mB, tiler, coord, Step<X,1,1>)  -> (256,64,4)
+      gC = local_tile(mC, tiler, coord, Step<1,1,X>)  -> (128,256)
+      gD = ...                                          -> (128,256)
+    (X = "ignore this tiler mode". A has no N, B has no M, C/D have no K.)
+    * printed gA shows (_128,_64,4): the per-CTA (post-peer-split) view.
+    Tiles_K = 4 comes from K/bK = 256/64 = 4 — the mainloop trip count.
+
+(b) Map SMEM (lines 198-206)
+    Reinterpret the dynamic SMEM blob as SharedStorage&, then get tCsA, tCsB — CuTe
+    tensors over the A/B SMEM buffers with the swizzled layouts.
+
+(c) MMA partitioning (lines 208-224)
+    mma_v = peer coordinate. cta_mma = tiled_mma.get_slice(mma_v) gives THIS CTA's
+    slice of the 2SM MMA. Then:
+      tCgA = cta_mma.partition_A(gA)  // A slice this CTA is responsible for
+      tCgB = cta_mma.partition_B(gB)
+      tCgC = cta_mma.partition_C(gC)  // accumulator/output mapping
+      tCgD = cta_mma.partition_C(gD)
+    These are GMEM-side partitions (the "g" tensors) that the TMA/epilogue will move.
+
+(d) MMA fragments (lines 226-233)
+    tCrA = cta_mma.make_fragment_A(tCsA)
+    tCrB = cta_mma.make_fragment_B(tCsB)
+    IMPORTANT: printed as "UMMA::DescriptorIterator o (_1,_1,_4)". These are NOT
+    register tiles holding data — they are iterators over SMEM DESCRIPTORS that
+    tcgen05.mma consumes. The shape's last mode _4 = the 4 K-blocks.
+
+(e) TMEM accumulator (lines 235-258)
+    tCtAcc = cta_mma.make_fragment_C(tCgC) — a TMEM tensor for the accumulator,
+    printed as tmem_[32b](...) o ((_128,_256),1,1). Each CTA owns a 128x256 half of
+    the 256x256 result.
+    TMEM must be allocated at runtime:
+      TmemAllocator = cute::TMEM::Allocator2Sm    // 2SM-aware allocator
+      elect_one_warp (warp 0) calls tmem_allocator.allocate(CapacityColumns,
+                                                            &tmem_base_ptr)
+      __syncthreads()   // all threads wait for the allocation
+      tCtAcc.data() = tmem_base_ptr   // point the accumulator at allocated TMEM
+    Using Allocator2Sm (not the 1SM allocator) is another 2SM-specific detail: it
+    reserves TMEM coherently across the peer pair.
+
+(f) TMA partitioning + multicast setup (lines 260-315)
+    Find this CTA's flat coordinate in the cluster:
+      cta_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+                                     block_rank_in_cluster())
+      elect_one_cta = (peer coord V == 0)   // this CTA is the LEADER of its pair
+    tma_partition reorders/offsets the SMEM & GMEM tensors to match the TMA atom and
+    tells TMA which cluster axis to multicast over:
+      A: multicast along cluster N-mode  -> [tAgA, tAsA]
+      B: multicast along cluster M-mode  -> [tBgB, tBsB]
+    group_modes<0,3> flattens (Mma, NumMma_M, NumMma_K) into one mode so TMA treats
+    the whole MK (or NK) tile as a single copy unit.
+    Multicast masks (16-bit, one bit per CTA in the 16-CTA cluster):
+      tma_mcast_mask_a = create_tma_multicast_mask<2>(...)   // share A across N
+      tma_mcast_mask_b = create_tma_multicast_mask<1>(...)   // share B across M
+      mma_mcast_mask_c = mask<0,1> | mask<0,2>               // peer+M and peer+N;
+                          used to signal the MMA-done barrier to all participants.
+    Transaction bytes (lines 302-304): total bytes TMA will deliver per K-tile,
+    counting BOTH peer CTAs (that's the "* size<0>(cluster_layout_vmnk)" = *2
+    factor) for A and B. The leader arms its barrier to expect exactly this many
+    bytes.
+
+(g) Barrier init (lines 317-327)
+    One elected thread initializes both mbarriers:
+      mma_barrier : arrival count = num_mcast_participants
+                    = clusterM + clusterN - 1 = 2 + 4 - 1 = 5
+                    (all CTAs whose SMEM this CTA's MMA result depends on / that
+                     depend on this SMEM must arrive before SMEM is reused).
+      tma_barrier : arrival count = 1 (a single TMA completion signal).
+    Two "phase bits" (mma/tma) track mbarrier flip state across loop iterations.
+    cluster_sync() makes all 16 CTAs observe the barrier init AND the TMEM alloc
+    before anyone proceeds — mandatory because CTAs read each other's SMEM.
+
+===== 5.2 MAINLOOP (lines 329-377) =====
+
+    tiled_mma.accumulate_ = UMMA::ScaleOut::Zero   // first MMA clears TMEM (D=A*B)
+
+    for k_tile in 0 .. Tiles_K-1 (=0..3):          // stream K in chunks of 64
+
+      // 2a: async TMA load of this K-tile of A and B (lines 337-351)
+      if (elect_one_warp && elect_one_thr):        // ONE thread issues TMA
+        if (elect_one_cta):                        // only leader arms the barrier
+          set_barrier_transaction_bytes(tma_barrier, tma_transaction_bytes)
+        copy(tma_atom_A.with(tma_barrier, mask_a), tAgA(_,k_tile), tAsA)
+        copy(tma_atom_B.with(tma_barrier, mask_b), tBgB(_,k_tile), tBsB)
+      // Both peer CTAs issue TMA (each pulls its half), but only the leader waits.
+
+      // 2b: MMA on the leader CTA (lines 353-373)
+      if (elect_one_cta):
+        wait_barrier(tma_barrier, tma_phase); tma_phase ^= 1   // block until data in
+        if (elect_one_warp):
+          for k_block in 0 .. size<2>(tCrA)-1 (=0..3):         // 4 K16 MMAs
+            gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCtAcc)
+            tiled_mma.accumulate_ = UMMA::ScaleOut::One          // accumulate rest
+          // Signal "MMA finished, SMEM A/B free to overwrite" to all participants:
+          umma_arrive_multicast_2x1SM(&mma_barrier, mma_mcast_mask_c)
+
+      // Every CTA waits for the MMA-done signal before the next TMA overwrites SMEM
+      wait_barrier(mma_barrier, mma_phase); mma_phase ^= 1
+
+    Key 2SM behaviors to notice:
+      * The tcgen05.mma is issued by ONLY the leader CTA's single elected thread —
+        yet it consumes A/B from BOTH peers' SMEM and writes BOTH peers' TMEM.
+      * cute::gemm() on a 2SM TiledMMA hides the peer coordination; user code just
+        calls it once per K-block.
+      * This example is SINGLE-BUFFERED (one A and one B SMEM slot). The
+        mma_barrier wait at the bottom prevents the next iteration's TMA from
+        clobbering SMEM still being read by the MMA. A production kernel would
+        multi-stage/pipeline this; the tutorial keeps it simple.
+
+===== 5.3 EPILOGUE (lines 379-409) =====
+
+    Goal: move the 256x256 accumulator out of TMEM, apply alpha/beta, store D.
+    Because accumulators live in TMEM on Blackwell, there is an explicit TMEM->RMEM
+    copy step that did not exist on earlier architectures.
+
+    tiled_t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tCtAcc)
+        // tcgen05.ld pattern: 32 data-path, 32-bit, 1x — the T2R (TMEM-to-register)
+        // copy atom, tiled across the 128 threads.
+    thr_t2r_copy = tiled_t2r_copy.get_slice(threadIdx.x)   // this thread's slice
+
+    // Read C (GMEM -> RMEM)
+    tDgC = thr_t2r_copy.partition_D(tCgC)
+    tDrC = make_fragment_like(tDgC)
+    copy(tDgC, tDrC)                       // plain vectorized global load of C
+
+    // Read accumulator (TMEM -> RMEM)
+    tDtAcc = thr_t2r_copy.partition_S(tCtAcc)
+    tDgD   = thr_t2r_copy.partition_D(tCgD)
+    tDrAcc = make_tensor<AccType>(shape(tDgD))
+    copy(tiled_t2r_copy, tDtAcc, tDrAcc)   // tcgen05.ld: TMEM -> registers
+
+    // Fuse scale: tDrC = alpha*tDrAcc + beta*tDrC
+    axpby(alpha, tDrAcc, beta, tDrC)
+
+    // Store D (RMEM -> GMEM)
+    copy(tDrC, tDgD)
+
+    __syncthreads()
+
+    // Free TMEM (lines 404-409)
+    if (elect_one_warp):
+      tmem_allocator.release_allocation_lock()   // let the next CTA rasterize/alloc
+      tmem_allocator.free(tmem_base_ptr, CapacityColumns)
+
+    Note this is a *register/store* epilogue. Tutorial 05 upgrades this to a TMA
+    epilogue (store D through the TMA engine).
+
+--------------------------------------------------------------------------------
+6. main() AND VERIFICATION (lines 610-738)
+--------------------------------------------------------------------------------
+1. Device guard: require compute capability 10.x (Blackwell SM100). Otherwise exit.
+2. Read M,N,K from argv (defaults 512/1024/256).
+3. Build A,B,C host tensors, fill with small random ints in [-2,2]
+   (initialize_tensor, example_utils.hpp:96 — small integers so the F16 product is
+   exactly representable, enabling an EXACT comparison).
+4. Copy A,B,C to device (thrust::device_vector), allocate device D.
+5. alpha=1, beta=0. Call gemm_host_f16xf16_f32_f32_tnt to run the kernel.
+6. Copy D back, run a plain triple-loop reference_gemm on the host.
+7. print_matrix_multiply_mollified_relative_error compares kernel vs reference;
+   success requires relative_error <= 0.0 — i.e. a BIT-EXACT match (achievable here
+   because inputs are tiny integers, so no floating rounding divergence).
+
+--------------------------------------------------------------------------------
+7. WHAT'S NEW IN 04 VERSUS 03 — THE 2SM DELTA IN ONE LIST
+--------------------------------------------------------------------------------
+1. MMA atom: SM100_MMA_F16BF16_2x1SM_SS (was 1SM). AtomThrID = 2, so two CTAs form
+   one MMA. Shape 256x256x16 spans the peer pair.
+2. Cluster layout gains the V (peer) mode: tiled_divide(cluster, AtomThrID) yields
+   VMNK. Everything downstream slices on V to know "am I leader or peer".
+3. TMA atoms: SM100_TMA_2SM_LOAD_MULTICAST + make_tma_atom_[A|B]_sm100 taking the
+   full mma_tiler + tiled_mma + cluster_layout (the 2SM API).
+4. TMEM allocator: TMEM::Allocator2Sm (2SM-coherent), not the 1SM allocator.
+5. Transaction bytes multiplied by size<0>(cluster_layout_vmnk)=2 — the barrier
+   accounts for both peers' arriving bytes.
+6. MMA-done signal: umma_arrive_multicast_2x1SM with mma_mcast_mask_c so both peers
+   (and multicast participants) learn SMEM is reusable.
+7. Leader/peer split: elect_one_cta gates who arms/waits the TMA barrier and who
+   issues the MMA; both peers still issue their own TMA half.
+
+--------------------------------------------------------------------------------
+8. CONCRETE NUMBERS (default M=512, N=1024, K=256), FROM THE FILE'S OWN PRINTS
+--------------------------------------------------------------------------------
+  Cluster            : 4 x 4 x 1  = 16 CTAs, 128 threads each.
+  MMA atom shape     : 256 x 256 x 16 (spans a 2-CTA peer pair).
+  MMA tiler          : 256 x 256 x 64 (K stacked 4x).
+  Per-CTA A in SMEM  : ((128,16),1,4)  swizzled Sw<3,4,3>  (128 rows = half of 256)
+  Per-CTA B in SMEM  : ((256,16),1,4)  swizzled Sw<3,4,3>
+  Per-CTA accumulator: 128 x 256 in TMEM (half of the 256x256 result).
+  Mainloop trips     : Tiles_K = K/bK = 256/64 = 4.
+  Inner MMAs per trip: size<2>(tCrA) = 4 (four K16 tcgen05.mma).
+  mma_barrier count  : clusterM+clusterN-1 = 2+4-1 = 5.
+  tma_barrier count  : 1.
+  Grid               : exactly one 4x4 cluster (one cluster covers 512x1024).
+
+--------------------------------------------------------------------------------
+9. MENTAL MODEL / TAKEAWAYS
+--------------------------------------------------------------------------------
+* On Blackwell an "MMA" is a cluster-level object, not a warp-level one. You tile
+  the problem for the MMA; the MMA's partitioning hands each CTA its share.
+* A 2SM MMA is one instruction issued by a single thread on the LEADER CTA that
+  reaches across a peer pair: it reads A/B from both CTAs' SMEM and writes both
+  CTAs' TMEM. CuTe's TiledMMA + tma_partition + multicast masks hide the plumbing.
+* Accumulators live in TMEM: allocate it, MMA into it, tcgen05.ld it to registers
+  in the epilogue, then free it. This is the biggest structural change from Hopper.
+* Async engines (TMA, MMA) are single-thread-issued and coordinate via mbarriers
+  with phase bits. The tutorial is single-buffered; real kernels pipeline these.
+* Multicast TMA reads each GMEM tile once and broadcasts it into every CTA that
+  needs it, cutting DRAM traffic; the masks encode exactly which CTAs receive it.
+
+================================================================================
+End of explanation.
+================================================================================
