@@ -1,0 +1,115 @@
+Step 2a: Load A and B Tiles — TMA Transaction Bytes Calculation
+===============================================================
+Source: cutlass/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu
+
+Runtime-verified: tma_transaction_bytes = 65536 bytes (64 KB)
+
+--------------------------------------------------------------------------------
+1. Key Parameters
+--------------------------------------------------------------------------------
+
+MMA instruction      : SM100_MMA_F16BF16_2x1SM_SS  (2-SM cooperative MMA)
+  MMA Shape (M,N,K)  : (256, 256, 16)              (line 461)
+  ThrLayoutVMNK      : (_2,_1,_1,_1)               (line 457)
+    V=2 means 2 CTAs collaborate on one MMA instruction
+
+TypeA                : cutlass::half_t  (FP16, 2 bytes)  (line 648)
+TypeB                : cutlass::half_t  (FP16, 2 bytes)  (line 650)
+
+MMA tiler (bM, bN, bK):
+  bM = tile_size<0>(tiled_mma)        = 256           (line 467)
+  bN = tile_size<1>(tiled_mma)        = 256           (line 468)
+  bK = tile_size<2>(tiled_mma) * 4    = 16 * 4 = 64  (line 469)
+    (4 MMA iterations along K; tcgen05.mma K-dim is 16 for 16-bit types)
+
+Cluster shape        : (ClusterM=2, ClusterN=2, ClusterK=1)  (line 526)
+cluster_layout_vmnk  : tiled_divide(cluster_shape, AtomThrID)
+  AtomThrID for 2SM MMA = 2  (V-dimension = 2 CTAs per SM-pair)
+  cluster total CTAs = 2*2 = 4
+  size<0>(cluster_layout_vmnk) = V = 4 / 2 = 2
+
+--------------------------------------------------------------------------------
+2. SMEM Tile Sizes (runtime-verified)
+--------------------------------------------------------------------------------
+
+Both A and B are split across the 2-SM pair along the M-dimension.
+Each CTA in the pair holds half of M (128 rows), and the full K (64 cols).
+B is also split: each CTA holds 128 rows of B (not 256), because the 2SM MMA
+partitions both operands symmetrically across the two collaborating CTAs.
+
+  tAsA shape (runtime): ((_8192, _1)) with 16b elements
+    cosize = 8192 elements
+    bytes  = 8192 * 2 = 16384 bytes  (= 128 * 64 * 2)
+
+  tBsB shape (runtime): ((_8192, _1)) with 16b elements
+    cosize = 8192 elements
+    bytes  = 8192 * 2 = 16384 bytes  (= 128 * 64 * 2)
+
+  sA_layout (runtime): Sw<3,4,3> o ((_128,_16),_1,_4):((_64,_1),_0,_16)
+    logical shape: 128 (M-per-CTA) x 16 (MmaK) x 1 x 4 (K-iters) = 8192 elements
+  sB_layout (runtime): Sw<3,4,3> o ((_128,_16),_1,_4):((_64,_1),_0,_16)
+    logical shape: 128 (N-per-CTA) x 16 (MmaK) x 1 x 4 (K-iters) = 8192 elements
+
+--------------------------------------------------------------------------------
+3. tma_transaction_bytes Formula (lines 303-304)
+--------------------------------------------------------------------------------
+
+  tma_transaction_bytes = size<0>(cluster_layout_vmnk) * sizeof(tAsA)
+                        + size<0>(cluster_layout_vmnk) * sizeof(tBsB)
+
+  Substituting values:
+    = 2 * 16384  +  2 * 16384
+    = 32768      +  32768
+    = 65536 bytes  (64 KB)                          ✓ matches runtime output
+
+--------------------------------------------------------------------------------
+4. Why size<0>(cluster_layout_vmnk) = 2
+--------------------------------------------------------------------------------
+
+  cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape), AtomThrID)
+                      = tiled_divide( (2,2,1), _2 )
+
+  tiled_divide folds the 2-CTA AtomThrID into the V-dimension:
+    cluster has 4 CTAs total, grouped into 4/2 = 2 SM-pairs
+    => size<0>(cluster_layout_vmnk) = 2
+
+  The formula multiplies sizeof(tAsA) and sizeof(tBsB) by 2 because the
+  TMA.2SM instruction writes into BOTH CTAs' SMEM simultaneously. The hardware
+  reports a single completion event to the leader CTA's mbarrier covering the
+  combined write across all 2 SM-pairs in the cluster:
+
+    2 SM-pairs * (16384 A bytes + 16384 B bytes) = 65536 bytes total
+
+--------------------------------------------------------------------------------
+5. Why Only the Leader CTA Calls set_barrier_transaction_bytes
+--------------------------------------------------------------------------------
+
+  The mbarrier lives in the leader CTA's SMEM. The TMA.2SM hardware decrements
+  it exactly once by tma_transaction_bytes when all writes complete. If the peer
+  CTA also called set_barrier_transaction_bytes, the barrier's expected count
+  would be doubled and wait_barrier would never fire.
+
+  Leader CTA : set_barrier_transaction_bytes(tma_barrier, 65536)  <- line 347
+               copy(tma_atom_A ...)  <- issues TMA.2SM for A      <- line 349
+               copy(tma_atom_B ...)  <- issues TMA.2SM for B      <- line 350
+               wait_barrier(tma_barrier, phase)                    <- line 357
+
+  Peer CTA   : (skips set_barrier_transaction_bytes)
+               copy(tma_atom_A ...)  <- also issues TMA.2SM for A <- line 349
+               copy(tma_atom_B ...)  <- also issues TMA.2SM for B <- line 350
+               (no wait — syncs later via mma_barrier)
+
+--------------------------------------------------------------------------------
+6. Summary Table
+--------------------------------------------------------------------------------
+
+  Component                    Elements    Elem size    Bytes/CTA    SM-pairs
+  ---------------------------  ----------  -----------  -----------  --------
+  A SMEM tile (per CTA)        8192        FP16 (2 B)   16384 B      x2
+  B SMEM tile (per CTA)        8192        FP16 (2 B)   16384 B      x2
+  ---------------------------  ----------  -----------  -----------  --------
+  tma_transaction_bytes                                 65536 B (64 KB)
+
+  A tile logical shape per CTA : 128 (M) x 64 (K)  [half of MmaTile_M=256]
+  B tile logical shape per CTA : 128 (N) x 64 (K)  [half of MmaTile_N=256]
+  Full MMA tile covered        : 256 (M) x 256 (N) x 64 (K)  across 2 CTAs
