@@ -113,3 +113,33 @@ partitions both operands symmetrically across the two collaborating CTAs.
   A tile logical shape per CTA : 128 (M) x 64 (K)  [half of MmaTile_M=256]
   B tile logical shape per CTA : 128 (N) x 64 (K)  [half of MmaTile_N=256]
   Full MMA tile covered        : 256 (M) x 256 (N) x 64 (K)  across 2 CTAs
+
+--------------------------------------------------------------------------------
+7. tma_transaction_bytes Scales with Cluster Size
+--------------------------------------------------------------------------------
+
+tma_transaction_bytes is computed from size<0>(cluster_layout_vmnk), which is
+the number of SM-pairs in the cluster and is directly derived from the cluster
+shape:
+
+  cluster_layout_vmnk = tiled_divide(cluster_shape(ClusterM, ClusterN, ClusterK),
+                                     AtomThrID=2)
+
+  size<0>(cluster_layout_vmnk) = (ClusterM * ClusterN * ClusterK) / AtomThrID
+                                = (2 * 2 * 1) / 2
+                                = 2                    <- this example
+
+So tma_transaction_bytes = 65536 bytes is specific to the 2x2 cluster used
+in this example. It would be different for other cluster sizes:
+
+  Cluster shape    Total CTAs    size<0> (SM-pairs)    tma_transaction_bytes
+  -------------    ----------    ------------------    ---------------------
+  2x1x1            2             1                     1 * (16384+16384) =  32768 B (32 KB)
+  2x2x1            4             2                     2 * (16384+16384) =  65536 B (64 KB)  <- this example
+  4x2x1            8             4                     4 * (16384+16384) = 131072 B (128 KB)
+
+The intuition: a larger cluster means more SM-pairs all receiving the same
+multicast TMA write simultaneously. The hardware counts the total bytes written
+across ALL SM-pairs before firing the single barrier completion event on the
+leader CTA. So the barrier must be programmed with the combined byte count
+covering every CTA that participates in the multicast.
