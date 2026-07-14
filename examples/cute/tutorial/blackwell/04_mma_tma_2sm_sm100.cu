@@ -279,6 +279,33 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
   auto cta_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(int(cute::block_rank_in_cluster()));
   auto elect_one_cta  = get<0>(cta_in_cluster_coord_vmnk) == Int<0>{};
 
+  // leiming debug
+//   if (thread0()) {
+//     printf("\n== DEBUG ==\n");
+//     printf("block_rank_in_cluster: %d\n", int(cute::block_rank_in_cluster()));
+//     print("cta_in_cluster_coord_vmnk:\t"); print(cta_in_cluster_coord_vmnk); print("\n");
+//     printf("  V (peer)=%d, M=%d, N=%d, K=%d\n",
+//         int(get<0>(cta_in_cluster_coord_vmnk)),
+//         int(get<1>(cta_in_cluster_coord_vmnk)),
+//         int(get<2>(cta_in_cluster_coord_vmnk)),
+//         int(get<3>(cta_in_cluster_coord_vmnk)));
+//     printf("\n==\n");
+// }
+// __syncthreads();
+
+  if (blockIdx.x < size<0>(cluster_shape) && blockIdx.y < size<1>(cluster_shape)) {
+    int cta_rank = int(cute::block_rank_in_cluster());
+    for (int r = 0; r < size(cluster_shape); ++r) {
+      if (cta_rank == r && threadIdx.x == 0) {
+      printf("\n== DEBUG ==\n");
+      printf("block_rank_in_cluster: %d\n", int(cute::block_rank_in_cluster()));
+      }
+      cute::cluster_sync();
+    }
+  }
+  __syncthreads();
+
+
   // Project the cluster_layout for tma_A along the N-modes
   auto [tAgA, tAsA] = tma_partition(tma_atom_A,
                                     get<2>(cta_in_cluster_coord_vmnk),          // The CTA coordinate along N mode of the cluster
@@ -313,6 +340,21 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
     printf("tma_mcast_mask_b: %x\n", tma_mcast_mask_b);
     printf("mma_mcast_mask_c: %x\n", mma_mcast_mask_c);
   } __syncthreads();
+
+  // leiming debug
+  if (blockIdx.x < size<0>(cluster_shape) && blockIdx.y < size<1>(cluster_shape)) {
+    int cta_rank = int(cute::block_rank_in_cluster());
+    for (int r = 0; r < size(cluster_shape); ++r) {
+      if (cta_rank == r && threadIdx.x == 0) {
+      printf("\n== DEBUG ==\n");
+      printf("block_rank_in_cluster: %d\n", int(cute::block_rank_in_cluster()));
+      printf("tma_mcast_mask_a: %x\n", tma_mcast_mask_a);
+      printf("tma_mcast_mask_b: %x\n", tma_mcast_mask_b);
+      }
+      cute::cluster_sync();
+    }
+  }
+  __syncthreads();
 
   // Barrier Initialization
   // Barriers in SMEM should be initialized by a single thread.
