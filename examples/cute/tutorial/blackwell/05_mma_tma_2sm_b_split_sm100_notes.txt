@@ -1,0 +1,271 @@
+========================================================================
+05_mma_tma_2sm_b_split_sm100  --  B-split Optimisation Notes
+========================================================================
+
+OVERVIEW
+--------
+05_mma_tma_2sm_b_split_sm100.cu is derived from 04_mma_tma_2sm_sm100.cu.
+It implements a B-tile split-load optimisation for the Blackwell 2SM GEMM:
+each CTA in the V-pair loads only its own N/2 slice of B into local SMEM,
+instead of each CTA loading the full N tile redundantly.  The hardware
+instruction tcgen05.mma.cta_group::2 reads both N-halves transparently via
+cross-SM cluster SMEM access.
+
+Result: 50% reduction in B bandwidth per CTA.
+Verified correct: relative error = 0.0 vs CPU reference.
+
+
+========================================================================
+BACKGROUND: WHY B IS REDUNDANTLY LOADED IN TUTORIAL 04
+========================================================================
+
+The 2SM MMA instruction (tcgen05.mma.cta_group::2) splits work across a
+V-pair (CTA 0 + CTA 1, two SMs in the same TPC).  The MMA traits define:
+
+    ALayout = Shape<_2, Shape<M/2, K>>,  Stride<M/2, Stride<_1, M>>
+    BLayout = Shape<_2, Shape<N/2, K>>,  Stride<N/2, Stride<_1, N>>
+    CLayout = Shape<_2, Shape<M/2, N>>,  Stride<M/2, Stride<_1, M>>
+
+  - A is split along M: V=0 owns rows [0..M/2-1], V=1 owns rows [M/2..M-1]
+  - B is split along N: V=0 owns cols [0..N/2-1], V=1 owns cols [N/2..N-1]
+  - C is split along M: same as A
+
+The hardware reads B from BOTH SMs' SMEM via the cluster distributed SMEM
+mechanism.  SM0's descriptor points to B[N0..N/2-1] in SM0's SMEM; SM1's
+descriptor points to B[N/2..N-1] in SM1's SMEM.  During MMA execution:
+
+    SM0 reads: B[N0..N/2-1]  from own SMEM          (local)
+               B[N/2..N-1]   from SM1's SMEM         (cross-SM, transparent)
+    SM1 reads: B[N0..N/2-1]  from SM0's SMEM         (cross-SM, transparent)
+               B[N/2..N-1]   from own SMEM           (local)
+
+This is confirmed by the CUTLASS documentation:
+  "Both CTAs consume the full gB for MMA, but for SMEM loading each CTA
+   loads its N-half."
+
+In Tutorial 04, however, each CTA loads the FULL N tile (N=256) into its
+own SMEM.  The N/2 that belongs to the partner SM is loaded redundantly,
+wasting 50% of B bandwidth.
+
+
+========================================================================
+THE OPTIMISATION
+========================================================================
+
+Build the TMA atom for B with b_mma_tiler = (M, N/2, K) instead of
+mma_tiler = (M, N, K).  Each TMA instruction then covers only N/2
+elements in the N-direction.
+
+The correct N/2 GMEM offset for each CTA is derived automatically from
+partition_B(gB), which applies the V-split offset from BLayout:
+
+    partition_B(gB) for V=0  ->  N-offset = blockIdx.y * N
+    partition_B(gB) for V=1  ->  N-offset = blockIdx.y * N + N/2
+
+tma_partition inherits these offsets into tBgB, so each CTA's TMA load
+naturally targets the correct N/2 slice of GMEM B without any additional
+coordinate arithmetic.
+
+
+========================================================================
+CODE CHANGES  (04 -> 05)
+========================================================================
+
+All changes are in gemm_host_f16xf16_f32_f32_tnt() and the kernel
+signature.  The kernel body (mainloop, epilogue, barriers) is UNCHANGED.
+
+------------------------------------------------------------------------
+Change 1: New constants  b_tile_N  and  b_mma_tiler  (host)
+------------------------------------------------------------------------
+
+    // NEW in 05
+    auto b_tile_N    = size<1>(mma_tiler) / Int<2>{};           // 256/2 = 128
+    auto b_mma_tiler = make_shape(size<0>(mma_tiler),
+                                  b_tile_N,
+                                  size<2>(mma_tiler));           // (256, 128, 64)
+
+b_mma_tiler describes the tile each CTA loads for B:
+  M=256 (full), N=128 (half), K=64 (full).
+
+------------------------------------------------------------------------
+Change 2: make_tma_atom_B_sm100 uses b_mma_tiler  (host)
+------------------------------------------------------------------------
+
+    // BEFORE (04)
+    Copy_Atom tma_atom_B = make_tma_atom_B_sm100(
+        SM100_TMA_2SM_LOAD_MULTICAST{},
+        mB, sB_layout,
+        mma_tiler,          // <-- full N=256
+        tiled_mma, cluster_layout_vmnk);
+
+    // AFTER (05)
+    Copy_Atom tma_atom_B = make_tma_atom_B_sm100(
+        SM100_TMA_2SM_LOAD_MULTICAST{},
+        mB, sB_layout,
+        b_mma_tiler,        // <-- N/2=128
+        tiled_mma, cluster_layout_vmnk);
+
+This is the ONLY functional change.  It tells the TMA descriptor that
+each load covers N/2 elements in the N-direction.  Everything downstream
+(SMEM layout, MMA descriptor, barrier bytes) adjusts automatically.
+
+------------------------------------------------------------------------
+Change 3: BMmaTiler_MNK kernel template parameter  (kernel signature)
+------------------------------------------------------------------------
+
+    // BEFORE (04)
+    template <class SharedStorage, ...,
+              class MmaTiler_MNK, class TiledMMA, ...>
+    void gemm_device(..., MmaTiler_MNK mma_tiler, TiledMMA tiled_mma, ...)
+
+    // AFTER (05)
+    template <class SharedStorage, ...,
+              class MmaTiler_MNK, class BMmaTiler_MNK, class TiledMMA, ...>
+    void gemm_device(..., MmaTiler_MNK mma_tiler,
+                          BMmaTiler_MNK b_mma_tiler,
+                          TiledMMA tiled_mma, ...)
+
+b_mma_tiler is passed to the kernel for type deduction only; it is not
+used in the kernel body.
+
+------------------------------------------------------------------------
+Change 4: Kernel launch passes b_mma_tiler  (host)
+------------------------------------------------------------------------
+
+    // BEFORE (04)
+    launch_kernel_on_cluster(..., mma_tiler, tiled_mma, cluster_shape, ...);
+
+    // AFTER (05)
+    launch_kernel_on_cluster(..., mma_tiler, b_mma_tiler,
+                                  tiled_mma, cluster_shape, ...);
+
+
+========================================================================
+WHAT DOES NOT CHANGE
+========================================================================
+
+Component                          Status      Reason
+---------------------------------  ----------  ---------------------------
+gB = local_tile(mB, mma_tiler)    unchanged   Full N=256; partition_B uses
+                                               it to compute per-CTA offsets
+tCgB = partition_B(gB)            unchanged   V-split offset baked in
+tCsB = tensor_sB()                unchanged   sB_layout is already N/2 per
+                                               SM (2SM BLayout per-SM view)
+tCrB = make_fragment_B(tCsB)      unchanged   Descriptor from N/2 SMEM;
+                                               hardware handles cross-SM read
+tma_partition(tma_atom_B, ...)    unchanged   M-coord=0, no TMA multicast;
+                                               N-offset comes from tCgB
+tma_mcast_mask_b                  unchanged   Single-bit mask (no TMA
+                                               multicast for B)
+tma_transaction_bytes             unchanged   sizeof(tBsB) already reflects
+                                               N/2 SMEM size automatically
+Mainloop (copy, gemm, barriers)   unchanged   No modification needed
+Epilogue                          unchanged   No modification needed
+
+
+========================================================================
+WHY tma_partition STILL WORKS CORRECTLY
+========================================================================
+
+    tma_partition(tma_atom_B,
+                  M_coord=0, M_layout=Layout<_1>,
+                  tCsB, group_modes<0,3>(tCgB))
+
+The multicast_offset inside tma_partition is:
+
+    multicast_offset = M_layout(M_coord) * (NumValSrc / cosize(M_layout))
+                     = 0 * (8192 / 1) = 0
+
+So tma_partition adds NO offset to tBgB.  The N-offset in tBgB comes
+entirely from tCgB, which inherits it from partition_B(gB):
+
+    V=0: tBgB N-offset = blockIdx.y * 256 + 0
+         -> loads B[N_start .. N_start+127]
+
+    V=1: tBgB N-offset = blockIdx.y * 256 + 128
+         -> loads B[N_start+128 .. N_start+255]
+
+The tma_atom_B (built with b_mma_tiler N=128) ensures each TMA instruction
+copies exactly 128 N-elements, so the load is correctly bounded.
+
+
+========================================================================
+KEY DEBUGGING INSIGHTS
+========================================================================
+
+Several incorrect approaches were tried before finding the minimal fix:
+
+1. Using b_mma_tiler in local_tile(mB, b_mma_tiler, mma_coord_b, ...)
+   with mma_coord_b N = blockIdx.y*2+V:
+   WRONG -- partition_B adds another N/2 on top, doubling the V-offset.
+   Observed: tBgB N-offset = 256 instead of 128 for V=1.
+
+2. Using V-coord in tma_partition:
+   WRONG -- multicast_offset is applied in the flattened TMA coordinate
+   space where K is the fast dimension.  Offset 4096 maps to K-offset 64,
+   not N-offset 128.  Caused cudaErrorIllegalAddress.
+
+3. Halving the SMEM buffer (sB_split_layout for SharedStorage):
+   WRONG -- the MMA descriptor needs the full N=256 SMEM layout to
+   correctly address both N-halves via cross-SM cluster SMEM.
+   Caused cudaErrorIllegalAddress.
+
+The correct solution is minimal: change only mma_tiler -> b_mma_tiler
+in make_tma_atom_B_sm100.  Everything else is already correct by
+construction of the 2SM MMA traits and tma_partition.
+
+
+========================================================================
+BANDWIDTH ANALYSIS
+========================================================================
+
+mma_tiler = (256, 256, 64), FP16 (2 bytes/element), per K-tile:
+
+Configuration                        A bytes/CTA  B bytes/CTA  Total/CTA
+-----------------------------------  -----------  -----------  ---------
+Tutorial 04 (2,1,1) baseline         32 KB        32 KB        64 KB
+Tutorial 04 (2,2,1) A multicast      16 KB        32 KB        48 KB
+Tutorial 05 (2,2,1) A mcast+B split  16 KB        16 KB        32 KB
+
+A multicast (already in 04 with (2,2,1)):
+  CTA 0 and CTA 2 share the same A tile (same V-column).
+  Each loads M128 x K64 = 16 KB instead of 32 KB.
+  mask_a = 5 (0b0101) for V=0 CTAs, mask_a = 10 (0b1010) for V=1 CTAs.
+
+B split (new in 05):
+  Each CTA loads N128 x K64 = 16 KB instead of N256 x K64 = 32 KB.
+  The partner's N-half is read via cross-SMEM during MMA.
+  mask_b = single bit (no TMA multicast for B).
+
+
+========================================================================
+CLUSTER SHAPE
+========================================================================
+
+Both Tutorial 04 and 05 use cluster_shape = (2, 2, 1) (4 CTAs total).
+
+cta_layout_vmnk: shape=(V=2, M=1, N=2, K=1), stride=(1, 2, 2, 4)
+
+  rank  (V, M, N, K)  linear index
+  ----  ------------  ------------
+  0     (0, 0, 0, 0)  0
+  1     (1, 0, 0, 0)  1
+  2     (0, 0, 1, 0)  2
+  3     (1, 0, 1, 0)  3
+
+V-pairs (B split):  {CTA 0, CTA 1}  and  {CTA 2, CTA 3}
+N-pairs (A mcast):  {CTA 0, CTA 2}  and  {CTA 1, CTA 3}
+
+
+========================================================================
+FILES
+========================================================================
+
+  04_mma_tma_2sm_sm100.cu                   Original tutorial (baseline)
+  05_mma_tma_2sm_b_split_sm100.cu           B-split optimisation
+  05_mma_tma_2sm_b_split_sm100_notes.txt    This document
+  build_sm110/build_cute_05_b_split.sh      Build / run / dump script
+
+Build and run:
+  cd /home/leimyu/01_research/leiming_dev/cutlass/build_sm110
+  bash build_cute_05_b_split.sh run
