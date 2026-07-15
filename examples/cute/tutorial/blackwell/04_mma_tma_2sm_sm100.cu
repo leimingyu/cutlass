@@ -330,16 +330,16 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
   int tma_transaction_bytes = size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tAsA))
                             + size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tBsB));
 
-  if (thread0()) {
-    print("tAgA:\t"); print(tAgA); print("\n");  // tAgA:   ArithTuple(_0,0) o (((_64,_128),_1),4):(((_1@0,_1@1),_0),_64@0)
-    print("tAsA:\t"); print(tAsA); print("\n");  // tAsA:   Sw<3,4,3>_smem_ptr[16b](SMEM_ADDR_A) o ((_8192,_1)):((_1,_0))
-    print("tBgB:\t"); print(tBgB); print("\n");  // tBgB:   ArithTuple(_0,0) o (((_64,_256),_1),4):(((_1@0,_1@1),_0),_64@0)
-    print("tBsB:\t"); print(tBsB); print("\n");  // tBsB:   Sw<3,4,3>_smem_ptr[16b](SMEM_ADDR_B) o ((_16384,_1)):((_1,_0))
-    printf("tma_transaction_bytes: %d\n", tma_transaction_bytes);
-    printf("tma_mcast_mask_a: %x\n", tma_mcast_mask_a);
-    printf("tma_mcast_mask_b: %x\n", tma_mcast_mask_b);
-    printf("mma_mcast_mask_c: %x\n", mma_mcast_mask_c);
-  } __syncthreads();
+  // if (thread0()) {
+  //   print("tAgA:\t"); print(tAgA); print("\n");  // tAgA:   ArithTuple(_0,0) o (((_64,_128),_1),4):(((_1@0,_1@1),_0),_64@0)
+  //   print("tAsA:\t"); print(tAsA); print("\n");  // tAsA:   Sw<3,4,3>_smem_ptr[16b](SMEM_ADDR_A) o ((_8192,_1)):((_1,_0))
+  //   print("tBgB:\t"); print(tBgB); print("\n");  // tBgB:   ArithTuple(_0,0) o (((_64,_256),_1),4):(((_1@0,_1@1),_0),_64@0)
+  //   print("tBsB:\t"); print(tBsB); print("\n");  // tBsB:   Sw<3,4,3>_smem_ptr[16b](SMEM_ADDR_B) o ((_16384,_1)):((_1,_0))
+  //   printf("tma_transaction_bytes: %d\n", tma_transaction_bytes);
+  //   printf("tma_mcast_mask_a: %x\n", tma_mcast_mask_a);
+  //   printf("tma_mcast_mask_b: %x\n", tma_mcast_mask_b);
+  //   printf("mma_mcast_mask_c: %x\n", mma_mcast_mask_c);
+  // } __syncthreads();
 
   // leiming debug
   if (blockIdx.x < size<0>(cluster_shape) && blockIdx.y < size<1>(cluster_shape)) {
@@ -350,6 +350,8 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
       printf("block_rank_in_cluster: %d\n", int(cute::block_rank_in_cluster()));
       printf("tma_mcast_mask_a: %x\n", tma_mcast_mask_a);
       printf("tma_mcast_mask_b: %x\n", tma_mcast_mask_b);
+      printf("mma_mcast_mask_c: %x\n", mma_mcast_mask_c);
+      printf("\n==\n");
       }
       cute::cluster_sync();
     }
